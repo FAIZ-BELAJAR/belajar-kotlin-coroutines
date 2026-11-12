@@ -5,6 +5,9 @@ package org.example
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
@@ -13,7 +16,11 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
@@ -23,6 +30,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.time.withTimeout
 import kotlinx.coroutines.time.withTimeoutOrNull
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.assertNotNull
 import java.time.Duration
@@ -699,6 +707,320 @@ class AppTest {
             }
 
             job.cancelAndJoin()
+        }
+    }
+
+//    Coroutine Scope
+//    Sampai test terakhir, kita selalu menggunakan GlobalScope untuk membuat coroutine, Kita belum membahas sama sekali soal Scope, seperti Apa itu GlobalScope?
+//    GlobalScope sebenarnya adalah salah satu implementasi Coroutine Scope
+//    Semua coroutine itu sebenarnya dijalankan dari sebuah coroutine scope
+//    Function launch dan async yang selama ini kita gunakan, sebenarnya adalah extension function dari coroutine scope
+//    Secara sederhana, coroutine scope adalah obejct life cycle nya coroutine
+
+//    Penggunaan Coroutine Scope
+//    CoroutineScope biasanya digunakan dalam sebuah flow yang saling berhubungan
+//    Misal saat ktia membuka sebuah halaman di mobile, maka kita akan membuat screen, lalu mengambil data ke server, lalu setelah mendapatkannya. kita akan menampilkan data tersebut di screen
+//    Flow tersebut harus saling terintegrasi, jika misal flow tersebut sukses maka harus sukses semua, jika dibatalkan maka harus dibatalkan proses selanjutnya
+//    Hal tersebut jika diibaratkan tiap aktivitas adalah coroutine, maka flow tersebut di simpan di sebuah coroutine scope
+//    Dan coroutine scope bisa dibatalkan nantinya dengan menggunakan method CoroutineScope.cancel()
+
+//    GlobalScope
+//    Sebelumnya kita selalu menggunakan GlobalScope untuk membuat coroutine
+//    Sebenarnya penggunaan GlobalScope tidak dianjurkan dalam pembuatan aplikasi
+//    Hal ini dikarenakan, jika semua coroutine menggunakan GlobalScope, maka secara otomatis akan sharing coroutine scope, hal ini agak menyulitkan saat kita misal ingin membatalkan sebuah flow,
+//    karena saat sebuah coroutine scope dibatalkan, maka semua coroutine yang terdapat di scope tersebut akan dibatalakan
+
+//    Membuat Coroutine Scope
+    @Test
+    internal fun testNewScope(){
+        val scope = CoroutineScope(Dispatchers.Default)
+    scope.launch {
+        delay(2000)
+        println("Run ${Thread.currentThread().name}: ${Date()}")
+    }
+
+    val scope2 = CoroutineScope(Dispatchers.IO)
+
+
+    scope2.launch {
+        delay(2000)
+        println("Run ${Thread.currentThread().name}: ${Date()} Gak dibatalin")
+    }
+
+    scope.launch {
+        delay(2000)
+        println("Run ${Thread.currentThread().name}: ${Date()}")
+    }
+
+    runBlocking {
+
+        //Jika ingin membatalkan suatu scope
+        scope.cancel()
+        println("Done")
+    }
+    }
+
+//    CoroutineScope function
+//    Kadang pembuatan coroutine scope itu terlalu kompleks jika hanya untuk kasus kasus yang sederhana, misal saja kita hanya ingin menggabungkan beberapa suspend function, lalu mengembalikan nilai tertentu
+//    Pada kasus yang sederhana, kita bisa mennggunakan coroutine Scope functon untuk menggabungkan beberapa suspend function
+//    Saat ada error di coroutine yang terdapat di dalam coroutine scope function tersebut, maka semua coroutine pun akan dibatalkan
+
+    suspend fun getFoo(): Int {
+        delay(1000)
+        return 10
+    }
+
+    suspend fun getBar(): Int {
+        delay(1000)
+        return 20
+    }
+
+    suspend fun getSum(): Int = coroutineScope {
+        val foo = async{getFoo()}
+        val bar = async{getBar()}
+
+        foo.await() + bar.await()
+    }
+
+    @Test
+    fun testCoroutineScope(){
+        val scope = CoroutineScope(Dispatchers.Default)
+        val job = scope.launch {
+           val res = getSum()
+            println("Result $res")
+        }
+
+        runBlocking {
+            job.join()
+        }
+    }
+
+//    Coroutine Scope Parent & Child
+//    Saat kita membuat sebuah coroutine dengan menggaunakan function coroutine Scope,
+//    sebenernya kita telah membuat child scope dimana parent nya adalah scope yang diatasnya
+//    Coroutine Scope itu saling berkaitan antara parent dan child nya
+//    Saat kita membuat child scope, secaraotomatis child scope akan menggunakan dispatcher milik parent
+//    Dan saat kita membatalkan parent scope, maka semua child scope nya pun akan dibatalkan
+
+    @Test
+    fun testChildDispatcher(){
+        val parentDispatcher = Executors.newFixedThreadPool(10).asCoroutineDispatcher()
+        val parentScope = CoroutineScope(parentDispatcher)
+        val job = parentScope.launch {
+            println("Parent thread is: ${Thread.currentThread().name}")
+            coroutineScope {
+                launch {
+                    println("Child thread is : ${Thread.currentThread().name}")
+                }
+            }
+        }
+
+        runBlocking {
+//            job.join()
+            job.cancelAndJoin()
+        }
+    }
+
+//    Coroutine Parent & Child
+//    Selain Coroutine Scope, coroutine sendiri bisa memiliki child coroutine
+//    Saat membuat coroutine child, secara otomatis kita akan mewarisi coroutine context yang ada di coroutine parent
+//    Dan coroutine parent akan menunggu sampai eksekusi coroutine child nya selesai semua
+
+    @Test
+    fun testParentChildCoroutine(){
+        runBlocking{
+            val job = GlobalScope.launch {
+                launch {
+                    delay(2000)
+                    println("Child 1 Done")
+                }
+
+                launch {
+                    delay(3000)
+                    println("Child 2 Done")
+                }
+
+                delay(1000)
+                println("Parent Done")
+            }
+
+            job.join()
+//            job.cancelAndJoin()
+        }
+    }
+
+//    cancelChildren Function
+//    Sebelumnya kita sudah bahas coroutine itu memiliki parent dan child
+//    Coroutine akan direpresentasikan sebagai Job (Deferred turunan dari Job), dan di Job kita bisa mendapatkan semua children nya menggunakan filed children
+//    Selain itu, ada sebuah function bernama cancelChildren, function ini bisa kita gunakan untuk membatalkan semua coroutine children
+//    Jika kita membatalkan Job Parent, kita tidak perlu membatalkan children nya secara manual, karena saat Job dibatalkan, semua child nya akan otomatis dibatalkan juga
+
+    @Test
+    fun testCancelChildren(){
+        runBlocking{
+            val job = GlobalScope.launch {
+                launch {
+                    delay(3000)
+                    println("Child 1 Done")
+                }
+
+                launch {
+                    delay(3000)
+                    println("Child 2 Done")
+                }
+
+                delay(1000)
+                println("Parent Done")
+            }
+
+            delay(2000)
+            job.cancelChildren()
+            job.join()
+        }
+    }
+
+//    Memberi Nama Coroutine
+//    Selain dispatcher, salah satu corotine context yang lain adalah CoroutineName
+//    CoroutineName bisa kita gunakan untuk mengubah nama coroutine sesuai dengan yang kita mau
+//    Hal ini sangat bermanfaat ketika kita melakukan proses debugging
+
+    @Test
+    fun testRenameCoroutine(){
+        val scope = CoroutineScope(Dispatchers.IO)
+        val job = scope.launch(CoroutineName("kot1")) {
+            println("in thread ${Thread.currentThread().name}")
+            withContext(CoroutineName("anak_kot_1")){
+                println("in thread ${Thread.currentThread().name}")
+            }
+        }
+
+        runBlocking {
+            job.join()
+        }
+    }
+
+//    Menggabungkan Context Element
+//    Seperti yang pernah dibahas di materi coroutine context
+//    CoroutineContext adalah kumpulan dari elemen elemen, contoh turunannya, adalah job
+//    CoroutineDispatcher dan yang terakhir yang sempat kita bahas adalah CoroutineName
+//    CoroutineContext memiliki method plus, sehingga sebenarnya kita bisa menggabungkan beberapa context element secara sekaligus, misal Dispatcher dan CoroutineName misalnya
+
+    @Test
+    fun testCoroutineElementContextGabung(){
+        val scope = CoroutineScope(Dispatchers.IO + CoroutineName("Dimas"))
+        val job = scope.launch{
+            println("${Thread.currentThread().name}")
+        }
+
+        runBlocking {
+            job.join()
+        }
+    }
+
+//    yield Function
+//    Seperti yang pernah kita bahas sebelumnya, bahwa suspend function akan dijalankan secara sequential, artinya jika ada sebuah suspend function yang panjang dan lama, ada baiknya kita beri kesempatan ke suspend  functionn lain nya untuk dijalankan
+//    Coroutine berjalan secara conccurent, artinya 1 dispacther bisa digunakan untuk mengeksekusi beberapa coroutine secara bergantian, Saat coroutine kita berjalan, dan jika kita ingin memberi kesempatan ke coroutine yang lain untuk berjalan, kita bisa menggunakan yield function
+//    yield function itu bisa di cancel, artinya jika sebuah coroutine telah dibatalkan, maka secara otomatis yield function akan throw CancellationException
+
+    suspend fun runNoYieldJob(number: Int) {
+        println("Start job $number in thread ${Thread.currentThread().name}")
+        println("End job $number in thread ${Thread.currentThread().name}")
+    }
+
+    suspend fun runYieldJob(number: Int) {
+        println("Start job $number in thread ${Thread.currentThread().name}")
+        yield()
+        println("End job $number in thread ${Thread.currentThread().name}")
+    }
+
+    @Test
+    fun testYieldFunction(){
+        val dispatcher = Executors.newFixedThreadPool(10).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher)
+
+        runBlocking {
+            scope.launch { runNoYieldJob(1) }
+            scope.launch { runNoYieldJob(2) }
+
+            scope.launch { runYieldJob(3) }
+            scope.launch { runYieldJob(4) }
+
+            delay(2000)
+        }
+    }
+
+//    awaitCancellation Function
+//    Secara default, sebuah coroutine akan berhenti ketika seluruh code selesai dijalankan
+//    Jika ada kebutuhan kita tidak mau coroutine berhenti sampa di Job nya di cancel, maka kita bisa menggunakan function awaitCancellation
+//    Function awaitCancellation akan throwCancellationException jika job di cancel, dan tidak akan mengentikan coroutine jika belum di cancel
+
+    @Test
+    fun testAwaitCancellation(){
+        runBlocking {
+            val job = launch {
+                try {
+                    println("Lakukan sesuatu")
+                    awaitCancellation()
+                } finally {
+                    println("Coroutine cancelled")
+                }
+            }
+
+            delay(5000)
+            job.cancelAndJoin()
+        }
+    }
+
+//    Exception Propagation
+//    Secara garis besar, exception di coroutine itu ada yang di ekspose ke yang memanggil coroutine ada yang tidak
+//    Pada launch, exception tidak akan di ekspose ketika memanggil function join, namun pada async exception akan di expose ketika memanggil di function di await
+
+    @Test
+    fun testExceptionAsync(){
+        runBlocking {
+            val deffered = GlobalScope.async<String> {
+                println("launch coroutine")
+                throw IllegalArgumentException()
+            }
+            try {
+                deffered.await()
+                println("finish async")
+            }catch (err: IllegalArgumentException){
+                println("Errnyanih: $err")
+            }
+            finally {
+                println("finally async")
+            }
+
+        }
+    }
+
+//    Coroutine Exception Handler
+//    Kadang kita ingin mengatur cara penangkapan exception di coroutine, hal ini bisa dilakukan dengan menggunakan interface CoroutineExceptionHandler
+//    CoroutineExceptionHandler adalah turunan dari CoroutineContext.Element, sehingga kita bisa menambahkannya kedalam coroutine context
+//    Ingat jenis CancellationException (dan turunannya) tidak akan diteruskan ke exception handler
+//    Coroutine exception handler hanya jalan di launch, tidak jalan di async, untuk async, kita tetap harus menangkap excption nya secara manual
+
+    @Test
+    internal fun testExceptionHandler(){
+        val exceptionHandler = CoroutineExceptionHandler{ context, throwable ->
+            println("Ups, error dengan pesan ${throwable.message}")
+        }
+
+        val scope = CoroutineScope(Dispatchers.IO + exceptionHandler)
+
+        runBlocking {
+            val job = scope.launch(exceptionHandler) {
+                println("run job")
+                throw IllegalArgumentException("error")
+            }
+            try {
+                job.join()
+            } catch (err: IllegalArgumentException){
+                println("ANJAY ADA ERRORNYA: $err")
+            }
+
+            println("finish")
         }
     }
 }
