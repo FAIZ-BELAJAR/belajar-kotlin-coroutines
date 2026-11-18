@@ -13,6 +13,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -20,13 +21,26 @@ import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.time.withTimeout
 import kotlinx.coroutines.time.withTimeoutOrNull
 import kotlinx.coroutines.withContext
@@ -1023,6 +1037,337 @@ class AppTest {
             println("finish")
         }
     }
+
+//    Job Default Behavior
+//    Secara Default, saat kita membuat coroutine scope, atau menjalankan coroutine, tipe coroutine tersebut adalah job
+//    Dalam Job, saat terjadi error, di salah satu corotine, maka error tersebut akan di propagate ke parent nya
+//    Dan secara otomatis akan membatalkan semua coroutine
+
+    @Test
+    internal fun testJobBehavior(){
+        val dispatcher = Executors.newFixedThreadPool(10).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher + Job())
+        val job1 = scope.launch {
+            delay(2000)
+            println("Job 1 Done")
+        }
+
+        val job2 = scope.launch {
+            delay(1000)
+            throw IllegalArgumentException("Job 2 Gagal")
+        }
+
+        runBlocking {
+            joinAll(job1, job2)
+        }
+    }
+
+//    Supervisor Job
+//    Jika kita tidak ingin satu coroutine gagal mengakibatkan dibatalkan nya seluruh coroutine lain nya karna Job Behavior
+//    Maka kita bisa menggunakan Supervisor Job
+//    Supervisor Job adalah tipe Job lain nya
+//    Supervisor job bisa menjadikan setiap coroutine memiliki kemampuan untuk error nya secara mandiri
+//    Hal ini berakibat jika ada coroutine error, parent tidak akan membatalkan seluruh coroutine yang lain
+
+    @Test
+    internal fun testSupervisorJob(){
+        val dispatcher = Executors.newFixedThreadPool(10).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher + SupervisorJob())
+        val job1 = scope.launch {
+            delay(2000)
+            println("Job 1 Done")
+        }
+
+        val job2 = scope.launch {
+            delay(1000)
+            throw IllegalArgumentException("Job 2 Gagal")
+        }
+
+        runBlocking {
+            joinAll(job1, job2)
+        }
+    }
+
+//    Supervisor Scope Function
+//    Kadang ada kondisi dimana kita tidak memiliki akses untuk mengubah sebuah coroutine scope
+//    Karena secara default sifatnya aadalah Job, maka kita bisa menggunakan supervisorScope function utnuk membuat coroutine yang sifatnya SupervisorJob
+
+    @Test
+    internal fun testSupervisorScopeFunction(){
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher + Job())
+
+        runBlocking {
+            scope.launch {
+                supervisorScope {
+              launch{
+                  delay(2000)
+                  println("Child1 Selesai")
+              }
+                launch {
+                    delay(1000)
+                    throw IllegalArgumentException("Gagal child 2 error")
+                }
+                }
+            }
+
+            delay(3000)
+        }
+    }
+
+//    Exceo=ption Handler di Job vs Supervisor Job
+//    Exception Handler di Job ataupun di Supervisor Job secara default akan di propagate ke parent nya
+//    Artinya jika kita membuatCoroutineExceptionHandler, kita harus membuatnya di parent tidak bisa dicoroutine child nya
+//    Jika kita menambahkan exception handler di coroutine child nya, maka itu tidak akan pernah digunakan
+
+    @Test
+    fun testExceptiontanpaExceptionHandlerSupervisor(){
+        val exceptionHandler = CoroutineExceptionHandler{
+            context, throwable ->
+            println("Error ${throwable.message}")
+        }
+
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher)
+
+        runBlocking {
+            val job = scope.launch {
+                launch(exceptionHandler) {
+                    println("Job Child")
+                    throw IllegalArgumentException("Child Error")
+                }
+            }
+
+            job.join()
+
+        }
+    }
+
+
+    //    Exception Handler dengan supervisorScope
+    //    Salah satu cara agar exception handler bisa dilakukan di coroutine child adalah dengan menggunakan supervisorScope
+    //    Saat menggunakan supervisorScope, maka exception bisa digunakan di parent coroutine di supervisorScope, atau sebenarnya coroutine child di scope yang ada di atas nya
+    //    Tapi ingat jika terjadi error di child nya coroutine yang ada di supervisorScope, maka tetap akan di propagate ke parent coroutine di supervisorScope
+    @Test
+    fun testExceptionExceptionHandlerSupervisor(){
+        val exceptionHandler = CoroutineExceptionHandler{
+                context, throwable ->
+            println("Error ${throwable.message}")
+        }
+
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher)
+
+        runBlocking {
+            val job = scope.launch {
+                supervisorScope {
+                    launch(exceptionHandler) {
+                        println("Job Child")
+                        throw IllegalArgumentException("Child Error")
+                    }
+                }
+            }
+
+            job.join()
+        }
+
+    }
+
+    //    Shared Mutable State
+    //    Saat ktia belajar kotlin collection, kita sudah tau tentang Immutable dan Mutable
+    //    Saat menggunakan coroutine, sangat disarankan untuk menggunakan data Immutable, apalagi jika data tersebut di sharing ke beberapa coroutine
+    //    Hal ini agar datanya aman, karena tidak bisa diubah oleh coroutine lain, jadi tidak akan terjdi problem race condition
+    //    Namun, bagaimana jika ternyata kita memang butuh sharing mutable data di beberapa coroutine sekaligus
+
+    @Test
+    fun testSharedMutableState(){
+        var counter = 0
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher)
+        repeat(100){
+            scope.launch {
+                repeat(10) {
+                    counter++
+                }
+            }
+        }
+
+        runBlocking {
+            delay(10_000)
+        }
+        println("Total Counter: $counter") // hasil tidak akan 1000 karna race condition
+    }
+
+//    Mutex
+//    Mutex (Mutual Exclusion) adalah salah satu fitr di Kotlin Coroutine untuk melakukan proses locking
+//    Dengan menggunakan mutex, kita bisa pastikan bahwa hanya ada 1 coroutine yang bisa mengakses kode tersebut, code coroutine yang lain akan menunggu sampai coroutine pertama selesai
+
+    @Test
+    fun testMutex(){
+        val mutex: Mutex = Mutex()
+        var counter = 0
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val scope = CoroutineScope(dispatcher)
+        repeat(100){
+            scope.launch {
+                repeat(10) {
+                    mutex.withLock { counter++ }
+                }
+            }
+        }
+
+        runBlocking {
+            delay(10_000)
+        }
+        println("Total Counter: $counter") // hasil akan 1000 karna bebas race condition
+    }
+
+//    Semaphore
+//    Sama seperti mutex, semaphore juga digunakan sebagai object untuk locking
+//    Namun yang membedakan, pada Mutex, kita hanya memperbolehkan 1 coroutine yang bisa mengakses nya pada satu waktu
+//    Namun pada Semaphore, kita bisa menentukan jumlah coroutine yang boleh mengakses nya dalam satu waktu
+    @Test
+    fun testSemaphore(){
+        var counter = 0
+        val dispatcher = Executors.newFixedThreadPool(2).asCoroutineDispatcher()
+        val semaphore = Semaphore(permits = 2) // artinya akan diperbolehkan 2 coroutine yang mengakses code dalam waktu yang sama
+        val scope = CoroutineScope(dispatcher)
+        repeat(100){
+            scope.launch {
+                repeat(10) {
+                    semaphore.withPermit{ counter++ }
+                }
+            }
+        }
+
+        runBlocking {
+            delay(10_000)
+        }
+        println("Total Counter: $counter") // hasil akan 1000 karna bebas race condition
+    }
+
+//    Asynchronous Flow
+//    Sampai saat ini kita hanya membahas tentang coroutine yang tidak mengembalikan value (launch) dan mengembalikan satu value(async), bagaimana jika kita butuh sebuah coroutine yang mengembalikan data berkali kali seperti layanya collection
+//    Kotlin mendukung hal tersebut dengan nama Flow
+//    Flow mirip dengan sequence di Kotlin Collection, yang membedakan adalah flow berjalan sebagai coroutine dan kita bisa menggunakan suspend function di flow
+//    Flow adalah collection cold, atau lazy, artiya jika tidak diminta datanya, flow tidak akan berjalan (kode nya tidak akan dieksekusi)
+
+//    Membuat Flow
+//    Untuk membuat flow, kita bisa menggunakan function flow()
+//    Di dalam flow untuk mengirim data kita bisa menggunakan function emit()
+//    Untuk mengakses data di flow, kita bisa menggunakan function collect()
+
+    @Test
+    internal fun testFlow(){
+        val flow: Flow<Int> = flow{
+            println("flow started")
+            repeat(10) { angka ->
+                delay(500)
+                emit(angka)
+            }
+        }
+
+        runBlocking {
+           flow.collect { println(it) }
+        }
+    }
+
+//    Flow Operator
+//    Flow mirip dengan Kotlin Collection, memiliki banyak operator
+//    Hampir semua operator yang ada di Kotlin Collection ada juga di Flow, seperti map, flatMap, filter, reduce dll
+//    Yang membedakan dengan operator yang ada di kotlin collection adalah, operator di flow mendukung suspend function
+
+    fun numberFlow(): Flow<Int> = flow {
+        repeat(100){ angka ->
+            emit(angka)
+        }
+    }
+
+    suspend fun changeToString(i: Int): String {
+        delay(100)
+        return "Number: ${i}"
+    }
+
+    @Test
+    fun testFlowOperator(){
+        val flow = numberFlow()
+        runBlocking {
+            flow.filter { angka -> angka % 2 == 0 }
+                .map { angka -> changeToString(angka) }
+                .collect { angka -> println(angka) }
+        }
+    }
+
+//    Flow Exception
+//    Saat terjadi exception pada flow, di bagian operator apapun, maka flow akan berhenti, lalu exception akan di throw oleh flow
+//    Untuk menangkan exception tersebut,kita bisa menggunakan block try-catch
+//    Namun flow juga menyediakan operator untuk menangkap exception tersebut, nama function nya adalah catch()
+//    Dan untuk finally, juga sudah menyediakan operatornya,nama function nya adalah onCompletion()
+//    Ingat, jika terjadi error di flow, flow akan dihentikan, jika kita ingin flow tidak berhenti saat terjadi error, pastikan kita selalu melakukan try catch di kode flow nya
+
+    @Test
+    fun testFlowException(){
+        val flow = numberFlow()
+        runBlocking {
+            flow.map { angka ->
+                check(angka %2 != 0)
+                angka }
+                .onEach { println(it) }
+                .onCompletion { println("Done") }
+                .catch { err -> println("Error ${err.message}") }
+                .collect{}
+
+        }
+    }
+
+//    Membatalkan Flow
+//    Flow adalah coroutine, artinya dia bisa dibatalkan
+//    Untuk membatalakn flow caranya sangat mudah, kita bisa menggunakan funciton cancel() milik coroutine Scope,
+//    function cancel() tersebut akan secara otomatis membatalkan job coroutine
+
+    @Test
+    fun testFlowCancellable(){
+        val flow =numberFlow()
+        val scope = CoroutineScope(Dispatchers.IO)
+        runBlocking {
+            scope.launch {
+                flow.onEach {
+                    if (it > 10) cancel()
+                    else "Nomor $it in ${Thread.currentThread().name}"
+                }.collect{hasil -> println(hasil)}
+            }
+        }
+    }
+
+//    Channel
+//    Channel adalah fitur di kotlin coroutine yang bisa dugunakan untuk mentransfer aliran data dari satu tempat ke tempat lain
+//    Channel mirip dengan struktur data queue, dimana ada data masuk dan ada data keluar
+//    Untuk mengirim data ke channel, kita bisa menggunakan function send() dan untuk mengambil data di channel kita bisa menggunakan function receive()
+//    Channel itu sifatnya blocking, artinya jiak tidak ada data di channel, saat kita mengambil data menggunakan receive, maka dia akan menunggu sampai ada datanya, dan begitu juga ketika ada data di channel, dan tidak ada yang mengambilnya, saat kita send(), dia akan menunggu sampai channel kosong (datanya diambil)
+//    Untuk menutup channel, kita bisa menggunakan function close()
+
+    @Test
+    fun testChannel(){
+        runBlocking {
+            val channel = Channel <Int>()
+            val job1 = launch{
+                println("Send1")
+                channel.send(1)
+                println("Send2")
+                channel.send(2)
+            }
+
+            val job2 = launch {
+                println("Receive ${channel.receive()}")
+                println("Receive ${channel.receive()}")
+            }
+            
+            joinAll(job1, job2)
+            channel.close()
+        }
+    }
 }
+
+
 
 
